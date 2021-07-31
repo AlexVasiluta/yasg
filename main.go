@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"html/template"
 	"io"
@@ -17,7 +16,6 @@ import (
 	"github.com/caarlos0/env/v6"
 
 	chtml "github.com/alecthomas/chroma/formatters/html"
-	"github.com/go-chi/chi"
 	mathjax "github.com/litao91/goldmark-mathjax"
 	"github.com/yuin/goldmark"
 	highlighting "github.com/yuin/goldmark-highlighting"
@@ -48,7 +46,42 @@ func (s *YASG) loadTemplates() (err error) {
 }
 
 func copyFS(outPath string, dir fs.FS) error {
-	panic("Not implemented")
+	return fs.WalkDir(dir, ".", func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		// Skip hidden files and directories
+		if len(path.Base(p)) > 1 && path.Base(p)[0] == '.' {
+			return nil
+		}
+
+		filePath := path.Join(outPath, p)
+		if d.IsDir() {
+			if err := os.MkdirAll(filePath, 0777); err != nil {
+				log.Println("Couldn't mkdir", err)
+				return err
+			}
+			return nil
+		}
+		file, err := dir.Open(p)
+		if err != nil {
+			return err
+		}
+
+		f, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE, 0644)
+		if err != nil {
+			return err
+		}
+		_, err = io.Copy(f, file)
+		err1 := f.Close()
+		if err == nil && err1 != nil {
+			err = err1
+		}
+		if err != nil {
+			return err
+		}
+		return nil
+	})
 }
 
 func (s *YASG) Generate(outPath string) error {
@@ -57,30 +90,31 @@ func (s *YASG) Generate(outPath string) error {
 	}
 
 	// Static files
-	/*
-		staticPath := path.Join(outPath, "static")
-		if err := os.MkdirAll(staticPath, 0777); err != nil {
-			return err
-		}
-		if err := copyFS(staticPath, s.staticFS); err != nil {
-			return err
-		}
-	*/
+	staticPath := path.Join(outPath, "static")
+	if err := os.MkdirAll(staticPath, 0777); err != nil {
+		return err
+	}
+	if err := copyFS(staticPath, s.staticFS); err != nil {
+		return err
+	}
 
 	// Content
-	fs.WalkDir(s.content, ".", func(p string, d fs.DirEntry, err error) error {
-		log.Println(p, err)
+	return fs.WalkDir(s.content, ".", func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
-			log.Println("Error #1234:", err)
+			return err
 		}
+		// Skip hidden files and directories
+		if len(path.Base(p)) > 1 && path.Base(p)[0] == '.' {
+			return nil
+		}
+
 		filePath := path.Join(outPath, p)
 		if d.IsDir() {
 			if err := os.MkdirAll(filePath, 0777); err != nil {
-				log.Println("aaa", err)
-				return fs.SkipDir
+				return err
 			}
+			return nil
 		}
-		log.Println(d.Name())
 		file, err := s.content.Open(p)
 		if err != nil {
 			return fs.SkipDir
@@ -88,18 +122,15 @@ func (s *YASG) Generate(outPath string) error {
 
 		out, name, err := s.getFileOutput(path.Base(p), file)
 		if err != nil {
-			log.Println(err)
-			return nil
+			return err
 		}
 
 		dir, _ := path.Split(filePath)
 		filePath = path.Join(dir, name)
-		log.Println("plm:", filePath)
 
 		f, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE, 0644)
 		if err != nil {
-			log.Println(err)
-			return nil
+			return err
 		}
 		_, err = io.Copy(f, out)
 		err1 := f.Close()
@@ -107,14 +138,11 @@ func (s *YASG) Generate(outPath string) error {
 			err = err1
 		}
 		if err != nil {
-			log.Println(err, err1)
-			return nil
+			return err
 		}
 
 		return nil
 	})
-
-	return nil
 }
 
 func must(f func() error) func() {
@@ -126,9 +154,9 @@ func must(f func() error) func() {
 }
 
 func (s *YASG) getFileOutput(filename string, r io.Reader) (io.Reader, string, error) {
-	// Special cases
 	s.once.Do(must(s.loadTemplates))
 
+	// Special cases
 	switch path.Ext(filename) {
 	case ".md":
 		filename = strings.ReplaceAll(filename, ".md", ".html")
@@ -139,7 +167,6 @@ func (s *YASG) getFileOutput(filename string, r io.Reader) (io.Reader, string, e
 		ctx := parser.NewContext()
 		var buf, out bytes.Buffer
 		if err := s.parser.Convert(md, &buf, parser.WithContext(ctx)); err != nil {
-			log.Println(err)
 			return nil, filename, err
 		}
 
@@ -149,7 +176,6 @@ func (s *YASG) getFileOutput(filename string, r io.Reader) (io.Reader, string, e
 		}
 
 		if err := s.templ.Execute(&out, t); err != nil {
-			fmt.Println(err)
 			return nil, filename, err
 		}
 		return &out, filename, nil
@@ -173,112 +199,20 @@ func (s *YASG) getFileOutput(filename string, r io.Reader) (io.Reader, string, e
 	}
 }
 
-func (s *YASG) GetRouter() http.Handler {
-	r := chi.NewRouter()
+func (s *YASG) GetRouter() (http.Handler, error) {
+	// Generate rendered fs to ease stuff
+	log.Println("Generating YASG router...")
 
-	if err := s.loadTemplates(); err != nil {
-		fmt.Println(err)
-		return nil
+	dir, err := os.MkdirTemp("", "yasg-*")
+	if err != nil {
+		return nil, err
 	}
 
-	if s.debug {
-		r.Use(func(next http.Handler) http.Handler {
-			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if err := s.loadTemplates(); err != nil {
-					http.Error(w, "An unexpected error occured while rendering the web page", 500)
-					fmt.Println(err)
-					return
-				}
-				next.ServeHTTP(w, r)
-			})
-		})
+	if err := s.Generate(dir); err != nil {
+		return nil, err
 	}
 
-	r.Mount("/static", http.FileServer(http.FS(s.staticFS)))
-	r.Mount("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		path := r.URL.Path
-
-		if strings.HasSuffix(path, "/") {
-			path += "index"
-		}
-
-		path = strings.Trim(path, "/")
-
-		if strings.HasSuffix(path, ".md") { // the request wants the raw md file
-			file, err := s.content.Open(path)
-			if err != nil {
-				fmt.Fprintln(w, "Not Found")
-				return
-			}
-			defer file.Close()
-
-			st, err := file.Stat()
-			if err != nil {
-				fmt.Fprintln(w, "Not Found")
-				return
-			}
-
-			http.ServeContent(w, r, st.Name(), st.ModTime(), file.(io.ReadSeeker))
-			io.Copy(w, file)
-			return
-		}
-
-		// check if an .md file exists, and if so, render it
-		npath := path + ".md"
-		md, err := fs.ReadFile(s.content, npath)
-		if err == nil {
-			ctx := parser.NewContext()
-			var buf bytes.Buffer
-			if err := s.parser.Convert(md, &buf, parser.WithContext(ctx)); err != nil {
-				fmt.Fprintln(w, "Error")
-				return
-			}
-
-			t := TemplParams{
-				Content:  template.HTML(buf.String()),
-				Metadata: meta.Get(ctx),
-			}
-
-			if err := s.templ.Execute(w, t); err != nil {
-				fmt.Println(err)
-			}
-			return
-		}
-
-		// try and serve a file that has just the content (for pbshow and pbclass)
-		npath = path + ".body"
-		chtm, err := fs.ReadFile(s.content, npath)
-		if err == nil {
-			t := TemplParams{
-				Content:  template.HTML(chtm),
-				Metadata: nil,
-			}
-			if err := s.templ.Execute(w, t); err != nil {
-				fmt.Println(err)
-			}
-			return
-		}
-
-		// try and serve a regular file
-		file, err := s.content.Open(path)
-		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrInvalid) {
-			fmt.Fprintln(w, "Not Found")
-			return
-		} else if err != nil {
-			fmt.Println(err)
-			return
-		}
-		defer file.Close()
-		st, err := file.Stat()
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-
-		http.ServeContent(w, r, st.Name(), st.ModTime(), file.(io.ReadSeeker))
-	}))
-
-	return r
+	return http.FileServer(http.Dir(dir)), nil
 }
 
 func New(debug bool, ffs fs.FS) (*YASG, error) {
@@ -333,12 +267,14 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	staticMD.Generate("./out")
+	//	staticMD.Generate("./out")
 
-	/*
-		log.Printf("Listening on port %d\n", cfg.Port)
-		if err := http.ListenAndServe(fmt.Sprintf(":%d", cfg.Port), staticMD.GetRouter()); err != nil {
-			log.Fatal(err)
-		}
-	*/
+	router, err := staticMD.GetRouter()
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("Listening on port %d\n", cfg.Port)
+	if err := http.ListenAndServe(fmt.Sprintf(":%d", cfg.Port), router); err != nil {
+		log.Fatal(err)
+	}
 }
